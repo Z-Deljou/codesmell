@@ -1,0 +1,395 @@
+# -*- coding: utf-8 -*-
+"""
+Multilabel Code-Smell • DeepSeek-Coder-6.7B + LoRA (no QLoRA, no git/HF push)
+- Uses custom classifier head on top of causal backbone
+- Anti-overfit: pos_weight (BCEWithLogits), WeightedRandomSampler, EarlyStopping,
+  Cosine LR, Warmup, Weight Decay
+- Robust LLaMA-family fixes: drop token_type_ids & num_items_in_batch in forward
+- Prints GPU availability and device name
+
+Data layout:
+  prepared_dataset/
+    ├── dataset.csv           (columns: file_path,codesmells)
+    └── output_code/<files...>
+
+"""
+
+import os, gc, json, math, random
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, f1_score, precision_score, recall_score
+
+from transformers import (
+    AutoConfig, AutoTokenizer, AutoModel,
+    Trainer, TrainingArguments, EarlyStoppingCallback
+)
+from huggingface_hub import snapshot_download
+
+# =================== Config ===================
+MODEL_NAME   = "deepseek-ai/deepseek-coder-6.7b-base"  # >=6B
+DATA_DIR     = "prepared_dataset"
+RESULTS_DIR  = "./results"
+SAVE_DIR     = "./checkpoint-best"
+REPORTS_DIR  = "./reports"
+
+SEED         = 42
+TEST_SIZE    = 0.10
+
+# H100-friendly defaults (adjust if OOM):
+BATCH_SIZE   = 2            # اگر OOM شد بکن 1
+GRAD_ACCUM   = 4            # افزایش مؤثر batch
+MAX_LEN      = 2048         # اگر OOM شد بکن 1536/1024
+NUM_EPOCHS   = 1
+LR           = 2e-5
+WEIGHT_DECAY = 0.05
+WARMUP_RATIO = 0.05
+LR_SCHED     = "cosine"
+
+SAVE_STEPS   = 100
+SAVE_TOTAL   = 2
+EARLY_STOP_PATIENCE = 6
+THR_DEFAULT  = 0.5
+
+# LoRA config (برای لایه‌های توجه در معماری LLaMA/DeepSeek)
+LORA_R          = 16
+LORA_ALPHA      = 32
+LORA_DROPOUT    = 0.1
+LORA_TARGETS    = ["q_proj", "k_proj", "v_proj", "o_proj"]  # رایج در LLaMA/DeepSeek
+
+# =================== Utils ===================
+def set_all_seeds(seed=SEED):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+    if torch.cuda.is_available(): torch.cuda.manual_seed_all(seed)
+
+def flush_cuda():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        try: torch.cuda.reset_peak_memory_stats()
+        except: pass
+
+def print_device():
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        print(f">>> GPU available: YES | {name}")
+    else:
+        print(">>> GPU available: NO (using CPU)")
+
+# pos_weight: (N-P)/P با کلیپ
+def compute_pos_weight(train_df, all_labels):
+    counts = np.zeros(len(all_labels), dtype=np.int64)
+    lab2idx = {L:i for i,L in enumerate(all_labels)}
+    for labs in train_df["labels"]:
+        for L in labs:
+            counts[lab2idx[L]] += 1
+    N = len(train_df)
+    pos = counts.astype(np.float32); pos[pos < 1] = 1.0
+    neg = N - pos
+    w = np.clip(neg / pos, 1.0, 20.0)
+    print(">>> pos_weight (min/mean/max):", float(w.min()), float(w.mean()), float(w.max()))
+    return torch.tensor(w, dtype=torch.float)
+
+def build_weighted_sampler(train_df):
+    freq = pd.Series([L for labs in train_df["labels"] for L in labs]).value_counts().to_dict()
+    weights = []
+    for labs in train_df["labels"]:
+        invs = [(1.0 / max(1, freq.get(L, 1))) for L in labs] if labs else [1.0]
+        weights.append(float(np.mean(invs)))
+    weights = np.array(weights, dtype=np.float64)
+    weights = weights / (weights.mean() + 1e-8)
+    print(">>> sampler weights (min/mean/max):", float(weights.min()), float(weights.mean()), float(weights.max()))
+    return WeightedRandomSampler(weights, num_samples=len(weights), replacement=True)
+
+# =================== Robust loaders ===================
+def load_tokenizer(model_or_dir: str):
+    try:
+        return AutoTokenizer.from_pretrained(model_or_dir, use_fast=False, trust_remote_code=True)
+    except Exception as e1:
+        print("[tok] cache dirty → snapshot clean download:", e1)
+        clean = snapshot_download(repo_id=model_or_dir, repo_type="model", revision="main")
+        return AutoTokenizer.from_pretrained(clean, use_fast=False, trust_remote_code=True)
+
+def load_backbone(model_or_dir: str):
+    cfg = AutoConfig.from_pretrained(model_or_dir, trust_remote_code=True)
+    base = AutoModel.from_pretrained(
+        pretrained_model_name_or_path=model_or_dir,
+        low_cpu_mem_usage=True,
+        trust_remote_code=True
+    )
+    return base, cfg
+
+# =================== LoRA (PEFT) ===================
+from peft import LoraConfig, get_peft_model
+
+def add_lora(backbone: nn.Module):
+    lcfg = LoraConfig(
+        r=LORA_R, lora_alpha=LORA_ALPHA, lora_dropout=LORA_DROPOUT,
+        target_modules=LORA_TARGETS, bias="none", task_type="CAUSAL_LM"
+    )
+    return get_peft_model(backbone, lcfg)
+
+# =================== Model with custom head ===================
+class CausalClassifier(nn.Module):
+    def __init__(self, backbone, hidden, num_cls, pos_w: torch.Tensor|None):
+        super().__init__()
+        self.backbone = backbone
+        self.dropout  = nn.Dropout(0.1)
+        self.fc       = nn.Linear(hidden, num_cls)
+        self.loss     = nn.BCEWithLogitsLoss(pos_weight=pos_w) if pos_w is not None else nn.BCEWithLogitsLoss()
+
+    def forward(self, input_ids=None, attention_mask=None, labels=None, **kw):
+        # Fix for LLaMA/DeepSeek with HF Trainer/Accelerate:
+        kw.pop("token_type_ids", None)
+        kw.pop("num_items_in_batch", None)
+
+        out  = self.backbone(input_ids=input_ids, attention_mask=attention_mask, **kw)
+        last = out.last_hidden_state  # [B,T,H]
+        if attention_mask is not None:
+            m = attention_mask.unsqueeze(-1)
+            pooled = (last*m).sum(1) / m.sum(1).clamp(min=1e-6)
+        else:
+            pooled = last.mean(1)
+        logits = self.fc(self.dropout(pooled))
+        loss = None
+        if labels is not None:
+            loss = self.loss(logits, labels.float())
+        return {"loss": loss, "logits": logits}
+
+def build_model_and_tok(num_labels: int, pos_weight: torch.Tensor):
+    tok = load_tokenizer(MODEL_NAME)
+    backbone, cfg = load_backbone(MODEL_NAME)
+    # LoRA only on backbone (هد آزاد می‌ماند)
+    backbone = add_lora(backbone)
+    # H100 → bf16 خوبه
+    try:
+        backbone.gradient_checkpointing_enable()
+    except Exception:
+        pass
+    hidden = getattr(cfg, "hidden_size", None) or getattr(cfg, "n_embd", None) or getattr(cfg, "n_embed", None)
+    if hidden is None:
+        raise RuntimeError("Cannot infer hidden_size from config")
+    model = CausalClassifier(backbone, hidden, num_labels, pos_weight)
+    # pad token safety
+    if tok.pad_token is None:
+        if getattr(tok, "eos_token", None): tok.pad_token = tok.eos_token
+        else:
+            tok.add_special_tokens({"pad_token":"<pad>"})
+            tok.pad_token = "<pad>"
+    return model, tok
+
+# =================== Dataset ===================
+class CodeDataset(Dataset):
+    def __init__(self, df, tok, code_root: Path, max_len: int):
+        self.df = df.reset_index(drop=True)
+        self.tok = tok
+        self.root = code_root
+        self.max_len = max_len
+    def __len__(self): return len(self.df)
+    def __getitem__(self, idx):
+        r = self.df.iloc[idx]
+        p = self.root / r["file_path"]
+        with open(p, "r", errors="ignore") as f:
+            code = f.read()
+        enc = self.tok(
+            code,
+            truncation=True,
+            padding="max_length",
+            max_length=self.max_len,
+            return_tensors="pt",
+            return_token_type_ids=False
+        )
+        item = {k: v.squeeze(0) for k,v in enc.items()}
+        item["labels"] = torch.tensor(r["encoded_labels"], dtype=torch.float)
+        return item
+
+# =================== Metrics & threshold sweep ===================
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    probs = 1/(1+np.exp(-logits))
+    thr = THR_DEFAULT
+    preds = (probs >= thr).astype(int)
+    eps = 1e-7
+    tp = (preds * labels).sum(0).astype(np.float32)
+    pp = preds.sum(0).astype(np.float32)
+    ap = labels.sum(0).astype(np.float32)
+    precision = (tp/(pp+eps)).mean().item()
+    recall    = (tp/(ap+eps)).mean().item()
+    f1        = (2*precision*recall/(precision+recall+eps))
+    accuracy  = (preds == labels).astype(np.float32).mean().item()
+    return {"accuracy": accuracy, "precision": precision, "recall": recall, "f1_score": f1}
+
+def sweep_thresholds(y_true, logits, labels, out_path):
+    probs = 1/(1+np.exp(-logits))
+    best_global = {"thr":0.5,"f1_macro":-1,"f1_micro":-1}
+    for thr in np.linspace(0.05, 0.95, 19):
+        pred = (probs >= thr).astype(int)
+        f1M = f1_score(y_true, pred, average="macro", zero_division=0)
+        f1m = f1_score(y_true, pred, average="micro", zero_division=0)
+        if (f1M+f1m) > (best_global["f1_macro"]+best_global["f1_micro"]):
+            best_global = {"thr":float(thr),"f1_macro":float(f1M),"f1_micro":float(f1m)}
+    per_label = {}
+    for j,L in enumerate(labels):
+        best = {"thr":0.5,"f1":-1}
+        yt = y_true[:,j]; pj = probs[:,j]
+        for thr in np.linspace(0.05,0.95,19):
+            f1j = f1_score(yt, (pj>=thr).astype(int), average="binary", zero_division=0)
+            if f1j > best["f1"]: best = {"thr":float(thr),"f1":float(f1j)}
+        per_label[L] = best
+    Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+    with open(out_path,"w",encoding="utf-8") as f:
+        json.dump({"global":best_global,"per_label":per_label}, f, ensure_ascii=False, indent=2)
+    print(">>> thresholds:", best_global)
+    return {"global":best_global,"per_label":per_label}
+
+# =================== Trainer subclass (sampler) ===================
+from transformers import Trainer
+
+class ImbTrainer(Trainer):
+    def __init__(self, *args, weighted_sampler=None, **kwargs):
+        super().__init__(*args, **kwargs); self._weighted_sampler = weighted_sampler
+    def get_train_dataloader(self):
+        if self.train_dataset is None: return None
+        return DataLoader(
+            self.train_dataset,
+            batch_size=self.args.train_batch_size,
+            sampler=self._weighted_sampler if self._weighted_sampler is not None else None,
+            shuffle=False if self._weighted_sampler is not None else True,
+            collate_fn=self.data_collator,
+            drop_last=self.args.dataloader_drop_last,
+            num_workers=self.args.dataloader_num_workers,
+            pin_memory=self.args.dataloader_pin_memory,
+        )
+
+# =================== Main ===================
+def main():
+    # env + device
+    os.environ["CUDA_LAUNCH_BLOCKING"] = "1"
+    os.environ["WANDB_DISABLED"] = "true"
+    set_all_seeds(SEED)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print_device()
+
+    Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
+
+    # ----- DATA -----
+    data_dir = Path(DATA_DIR)
+    csv_path = data_dir/"dataset.csv"
+    code_root = data_dir/"output_code"
+    if not csv_path.exists() or not code_root.exists():
+        raise FileNotFoundError(f"Need {csv_path} and {code_root}")
+    df = pd.read_csv(csv_path, header=None, names=["file_path","codesmells"])
+    if df.iloc[0,0] == "file_path" or df.iloc[0,1] == "codesmells":
+        df = df.iloc[1:].reset_index(drop=True)
+    df["labels"] = df["codesmells"].apply(lambda x: str(x).split(","))
+    all_labels = sorted(list(set(L for labs in df["labels"] for L in labs)))
+    lab2idx = {L:i for i,L in enumerate(all_labels)}
+    df["encoded_labels"] = df["labels"].apply(lambda ys: [1 if L in ys else 0 for L in all_labels])
+
+    # split
+    try:
+        grp = df["labels"].apply(lambda x: " ".join(sorted(x)))
+        if grp.value_counts().min() >= 2:
+            train_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=SEED, shuffle=True, stratify=grp)
+        else:
+            print("[data] stratify disabled (rare groups < 2).")
+            train_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=SEED, shuffle=True)
+    except Exception as e:
+        print("[data] stratify failed → simple split:", e)
+        train_df, test_df = train_test_split(df, test_size=TEST_SIZE, random_state=SEED, shuffle=True)
+
+    print(f">>> #labels={len(all_labels)} | train={len(train_df)} test={len(test_df)}")
+    pos_weight = compute_pos_weight(train_df, all_labels).to(device)
+    weighted_sampler = build_weighted_sampler(train_df)
+
+    # ----- MODEL & TOKENIZER -----
+    model, tokenizer = build_model_and_tok(num_labels=len(all_labels), pos_weight=pos_weight)
+    # cache off for checkpointing
+    try:
+        if hasattr(model.backbone.config, "use_cache"):
+            model.backbone.config.use_cache = False
+    except Exception:
+        pass
+
+    # datasets
+    train_ds = CodeDataset(train_df, tokenizer, code_root, MAX_LEN)
+    test_ds  = CodeDataset(test_df , tokenizer, code_root, MAX_LEN)
+
+    # ----- TRAIN ARGS -----
+    # bf16 روی H100 فعال می‌شود؛ در غیر اینصورت fp16
+    use_bf16 = torch.cuda.is_available() and torch.cuda.get_device_capability(0)[0] >= 8
+    use_fp16 = False if use_bf16 else True
+
+    steps_per_epoch = math.ceil(len(train_ds) / (BATCH_SIZE * GRAD_ACCUM))
+    total_steps = max(1, steps_per_epoch * NUM_EPOCHS)
+    warmup_steps = max(1, int(WARMUP_RATIO * total_steps))
+
+    args = TrainingArguments(
+        output_dir=RESULTS_DIR,
+        evaluation_strategy="steps", eval_steps=SAVE_STEPS,
+        save_strategy="steps", save_steps=SAVE_STEPS, save_total_limit=SAVE_TOTAL,
+        load_best_model_at_end=True, metric_for_best_model="f1_score", greater_is_better=True,
+        learning_rate=LR, per_device_train_batch_size=BATCH_SIZE, per_device_eval_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM, num_train_epochs=NUM_EPOCHS,
+        weight_decay=WEIGHT_DECAY, bf16=use_bf16, fp16=use_fp16, optim="adamw_torch",
+        logging_steps=max(10, SAVE_STEPS//2), report_to="none",
+        lr_scheduler_type=LR_SCHED, warmup_steps=warmup_steps,
+        dataloader_num_workers=2,
+    )
+
+    trainer = ImbTrainer(
+        model=model, tokenizer=tokenizer, args=args,
+        train_dataset=train_ds, eval_dataset=test_ds,
+        compute_metrics=compute_metrics,
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=EARLY_STOP_PATIENCE, early_stopping_threshold=0.0)],
+        weighted_sampler=weighted_sampler
+    )
+
+    # ----- TRAIN -----
+    print("\n=== TRAIN ===")
+    flush_cuda()
+    train_out = trainer.train()
+    print(">>> Training done.")
+    if hasattr(train_out, "metrics"): print(">>> Train metrics:", train_out.metrics)
+    flush_cuda()
+
+    # ----- EVAL + THRESH SWEEP -----
+    print("\n=== EVAL ===")
+    res = trainer.evaluate()
+    print(">>> HF eval (thr=0.5):", res)
+    pred = trainer.predict(test_ds)
+    logits = pred.predictions
+    y_true = pred.label_ids
+    thr_conf = sweep_thresholds(y_true, logits, all_labels, out_path=str(Path(REPORTS_DIR)/"thresholds.json"))
+
+    thr = thr_conf["global"]["thr"]
+    probs = 1/(1+np.exp(-logits))
+    bin_preds = (probs >= thr).astype(int)
+    macro_f1 = f1_score(y_true, bin_preds, average="macro", zero_division=0)
+    micro_f1 = f1_score(y_true, bin_preds, average="micro", zero_division=0)
+    macro_p  = precision_score(y_true, bin_preds, average="macro", zero_division=0)
+    micro_p  = precision_score(y_true, bin_preds, average="micro", zero_division=0)
+    macro_r  = recall_score(y_true, bin_preds, average="macro", zero_division=0)
+    micro_r  = recall_score(y_true, bin_preds, average="micro", zero_division=0)
+    print(f">>> sklearn (thr={thr:.2f}) macro -> P:{macro_p:.4f} R:{macro_r:.4f} F1:{macro_f1:.4f}")
+    print(f">>> sklearn (thr={thr:.2f}) micro -> P:{micro_p:.4f} R:{micro_r:.4f} F1:{micro_f1:.4f}")
+    try:
+        print("\n>>> Per-label report:\n", classification_report(y_true, bin_preds, target_names=all_labels, zero_division=0))
+    except Exception:
+        print("\n>>> Per-label report:\n", classification_report(y_true, bin_preds, zero_division=0))
+
+    # ----- SAVE BEST -----
+    Path(SAVE_DIR).mkdir(parents=True, exist_ok=True)
+    trainer.save_model(SAVE_DIR)
+    tokenizer.save_pretrained(SAVE_DIR)
+    print(">>> Saved best to", SAVE_DIR)
+    print("\nAll done ✅")
+
+if __name__ == "__main__":
+    main()
